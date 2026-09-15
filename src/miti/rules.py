@@ -5,7 +5,6 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass
 
-from .config import Settings
 from .models import Category, Classification, Message
 
 _INVOICE = re.compile(r"\b(invoice|tax invoice|amount due|bill(?:ing)?)\b", re.IGNORECASE)
@@ -16,19 +15,7 @@ _CONVERSATIONAL_TEXT = re.compile(r"\b(hi|hello|thanks|thank you|regards|cheers)
 
 @dataclass(frozen=True)
 class RuleSet:
-    trusted_senders: frozenset[str]
-    trusted_domains: frozenset[str]
-    known_vendors: frozenset[str]
-    known_contacts: frozenset[str]
-
-    @classmethod
-    def from_settings(cls, settings: Settings) -> "RuleSet":
-        return cls(
-            settings.trusted_senders,
-            settings.trusted_domains,
-            settings.known_vendors,
-            settings.known_contacts,
-        )
+    """Marker for the fixed, conservative classification rules."""
 
 
 def classify(message: Message, rules: RuleSet) -> Classification:
@@ -47,23 +34,17 @@ def classify(message: Message, rules: RuleSet) -> Classification:
         )
 
     evidence = bool(_INVOICE.search(content))
-    trusted = message.sender_email in rules.trusted_senders or message.sender_domain in rules.trusted_domains
-    vendor = message.sender_email in rules.known_vendors or message.sender_domain in rules.known_vendors
     pdf_attachment = any(item.is_pdf for item in message.attachments)
-    safe_pdf_link = any(url.lower().startswith("https://") for url in message.urls)
-    if evidence and (pdf_attachment or safe_pdf_link):
+    if evidence and pdf_attachment:
         reasons = ["invoice wording found"]
-        reasons.append("PDF attachment found" if pdf_attachment else "HTTPS PDF link found")
-        if trusted or vendor:
-            reasons.append("sender matches configured trusted vendor/sender")
+        reasons.append("PDF attachment found")
         return Classification(
-            Category.INVOICE, 0.98 if trusted or vendor else 0.90, tuple(reasons),
+            Category.INVOICE, 0.90, tuple(reasons),
             automation_confidence, automation_reasons,
         )
 
     marketing = bool(_MARKETING.search(content))
-    human = "known_contact" in automation_reasons or "reply_or_forward" in automation_reasons
-    if automation_confidence >= 0.9 and marketing and not human:
+    if automation_confidence >= 0.9 and marketing and "reply_or_forward" not in automation_reasons:
         return Classification(
             Category.ADVERTISEMENT,
             min(0.99, 0.80 + automation_confidence * 0.2),
@@ -73,7 +54,7 @@ def classify(message: Message, rules: RuleSet) -> Classification:
         )
     reasons = ["no high-precedence deterministic rule matched"]
     if evidence:
-        reasons.append("invoice wording lacks a PDF attachment or safe HTTPS PDF link")
+        reasons.append("invoice wording lacks a PDF attachment")
     return Classification(Category.UNCLASSIFIED, 0.0, tuple(reasons), automation_confidence, automation_reasons)
 
 
@@ -96,13 +77,9 @@ def _automation_evidence(message: Message, rules: RuleSet, content: str) -> tupl
     add(any(name in headers for name in ("x-campaign-id", "x-mailing-list", "x-bulkmail")), 0.25, "bulk_mail_header")
     local_part = message.sender_email.partition("@")[0]
     add(local_part in {"noreply", "no-reply", "donotreply", "do-not-reply"}, 0.20, "no_reply_sender")
-    add(message.sender_email in rules.known_vendors or message.sender_domain in rules.known_vendors, 0.15, "known_vendor")
     add(bool(_AUTOMATED_TEXT.search(content)), 0.15, "automated_template")
 
     human_signals = 0.0
-    if message.sender_email in rules.known_contacts:
-        human_signals += 0.55
-        reasons.append("known_contact")
     if subject_is_reply_or_forward(message.subject):
         human_signals += 0.25
         reasons.append("reply_or_forward")

@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import base64
 
-from miti.config import Settings
 from miti.models import Category
 from miti.normalize import normalize_message
 from miti.rules import RuleSet, classify
@@ -41,12 +40,19 @@ def test_normalizes_nested_bodies_urls_and_sender_address() -> None:
 
 
 def test_classifier_precedence_and_conservative_invoice() -> None:
-    rules = RuleSet(frozenset(), frozenset(), frozenset(), frozenset())
+    rules = RuleSet()
     shift = normalize_message(raw_message("Shift Report and invoice", []))
     assert classify(shift, rules).category is Category.SHIFT_REPORT
 
     no_pdf = normalize_message(raw_message("Invoice 88", [{"mimeType": "text/plain", "body": {"data": encoded("Invoice due")}}]))
     assert classify(no_pdf, rules).category is Category.UNCLASSIFIED
+
+    linked_pdf = normalize_message(raw_message("Invoice 88", [
+        {"mimeType": "text/plain", "body": {"data": encoded("Invoice due: https://vendor.example/invoice.pdf")}},
+    ]))
+    linked_result = classify(linked_pdf, rules)
+    assert linked_result.category is Category.UNCLASSIFIED
+    assert "invoice wording lacks a PDF attachment" in linked_result.reasons
 
     invoice = normalize_message(raw_message("Invoice 88", [
         {"mimeType": "text/plain", "body": {"data": encoded("Invoice due")}},
@@ -58,7 +64,7 @@ def test_classifier_precedence_and_conservative_invoice() -> None:
 
 
 def test_advertisement_requires_multiple_automation_signals() -> None:
-    rules = RuleSet(frozenset(), frozenset(), frozenset(), frozenset())
+    rules = RuleSet()
     automated = normalize_message(raw_message("Special offer", [], [
         {"name": "List-ID", "value": "offers.example"},
         {"name": "List-Unsubscribe", "value": "<https://example.test/unsubscribe>"},
@@ -67,16 +73,3 @@ def test_advertisement_requires_multiple_automation_signals() -> None:
     assert result.category is Category.ADVERTISEMENT
     assert result.automation_confidence >= 0.9
     assert {"list_header", "list_unsubscribe"} <= set(result.automation_reasons)
-
-
-def test_known_contact_reduces_automation_confidence() -> None:
-    rules = RuleSet(frozenset(), frozenset(), frozenset(), frozenset({"person@example.test"}))
-    message = normalize_message(raw_message("Re: Special offer", [], [
-        {"name": "List-ID", "value": "offers.example"},
-        {"name": "List-Unsubscribe", "value": "<https://example.test/unsubscribe>"},
-        {"name": "From", "value": "Person <person@example.test>"},
-    ]))
-    result = classify(message, rules)
-    assert result.category is Category.UNCLASSIFIED
-    assert result.automation_confidence < 0.9
-    assert "known_contact" in result.automation_reasons

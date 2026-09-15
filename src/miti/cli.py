@@ -3,47 +3,50 @@
 from __future__ import annotations
 
 import json
-import logging
-import sqlite3
 import sys
 from collections.abc import Iterable
-from dataclasses import asdict
 from pathlib import Path
-from typing import Annotated, Any
+from typing import Annotated
 
 import typer
+from loguru import logger
+from rich.console import Console
+from rich.table import Table
 
 from .config import Settings, load_settings
-from .gmail import GmailClient, GoogleGmailClient
+from .gmail import GmailClient, GoogleGmailClient, UNREAD_INBOX_QUERY
 from .ledger import Ledger
-from .models import Classification, Message
+from .models import Category, Classification, Message
 from .normalize import normalize_message
-from .processor import LABELS, apply_plan, plan
+from .processor import apply_plan, plan
 from .rules import RuleSet, classify as classify_message
 
 app = typer.Typer(help="Rule-first, auditable Gmail automation.")
-rules_app = typer.Typer(help="Inspect and validate deterministic classification rules.")
-labels_app = typer.Typer(help="Manage the labels used by miti.")
-app.add_typer(rules_app, name="rules")
-app.add_typer(labels_app, name="labels")
+reports_app = typer.Typer(help="Process report emails by report type.")
+app.add_typer(reports_app, name="reports")
+SHIFT_REPORT_QUERY = f'{UNREAD_INBOX_QUERY} subject:"Shift Report"'
+BOX_OFFICE_REPORT_QUERY = f'{UNREAD_INBOX_QUERY} subject:"BOR - Golden Age Cinema- Nightly"'
+INVOICE_QUERY = f"{UNREAD_INBOX_QUERY} invoice has:attachment filename:pdf"
+ADVERTISEMENT_QUERY = f"{UNREAD_INBOX_QUERY} {{category:promotions unsubscribe}}"
 
 
-class _JsonFormatter(logging.Formatter):
-    def format(self, record: logging.LogRecord) -> str:
-        payload: dict[str, Any] = {"level": record.levelname, "event": record.getMessage()}
-        fields = getattr(record, "fields", None)
-        if isinstance(fields, dict):
-            payload.update(fields)
-        return json.dumps(payload, ensure_ascii=False)
+def _table(title: str, columns: tuple[str, ...], rows: Iterable[tuple[str, ...]]) -> None:
+    table = Table(title=title, expand=True)
+    for column in columns:
+        table.add_column(column)
+    for row in rows:
+        table.add_row(*row)
+    Console().print(table)
 
 
 def _configure_logging() -> None:
-    handler = logging.StreamHandler()
-    handler.setFormatter(_JsonFormatter())
-    logger = logging.getLogger("miti")
-    if not logger.handlers:
-        logger.addHandler(handler)
-    logger.setLevel(logging.INFO)
+    logger.remove()
+    logger.add(
+        sys.stderr,
+        level="INFO",
+        colorize=sys.stderr.isatty(),
+        format="<green>{time:HH:mm:ss}</green> | <level>{level}</level> | <level>{message}</level>",
+    )
 
 
 def _settings(ctx: typer.Context) -> Settings:
@@ -56,11 +59,10 @@ def _settings(ctx: typer.Context) -> Settings:
 @app.callback()
 def root(
     ctx: typer.Context,
-    config: Annotated[Path | None, typer.Option("--config", help="TOML configuration path.")] = None,
 ) -> None:
     """Use --apply to mutate Gmail; previews are the default."""
     _configure_logging()
-    ctx.obj = load_settings(config)
+    ctx.obj = load_settings()
 
 
 def _load_fixture(path: Path) -> list[dict[str, Any]]:
@@ -72,144 +74,178 @@ def _load_fixture(path: Path) -> list[dict[str, Any]]:
     return data
 
 
-def _messages(
-    settings: Settings, fixture: Path | None, max_results: int, include_attachment_data: bool = False
-) -> tuple[list[Message], GmailClient | None]:
-    if fixture:
-        return [normalize_message(raw, include_attachment_data=include_attachment_data) for raw in _load_fixture(fixture)], None
-    client = GoogleGmailClient.from_credentials(settings.credentials_path, settings.client_secret_path)
-    stubs = client.list_unread_inbox(max_results)
-    messages = [
-        normalize_message(
-            client.get_message(str(stub["id"])),
-            client.get_attachment,
-            include_attachment_data=include_attachment_data,
-        )
-        for stub in stubs
-    ]
-    return messages, client
-
-
-def _classifications(messages: Iterable[Message], settings: Settings) -> list[tuple[Message, Classification]]:
-    rules = RuleSet.from_settings(settings)
+def _classifications(messages: Iterable[Message]) -> list[tuple[Message, Classification]]:
+    rules = RuleSet()
     return [(message, classify_message(message, rules)) for message in messages]
 
 
 @app.command()
 def auth(
     ctx: typer.Context,
-    client_secret: Annotated[Path | None, typer.Option("--client-secret", help="OAuth desktop client JSON.")] = None,
+    client_secret: Annotated[Path | None, typer.Argument(help="OAuth desktop client JSON.")] = None,
 ) -> None:
     """Authorize Gmail with only gmail.modify and gmail.send scopes."""
     settings = _settings(ctx)
     secret = client_secret or settings.client_secret_path
     GoogleGmailClient.authorize(secret, settings.credentials_path)
-    typer.echo(json.dumps({"status": "authorized", "credentials_path": str(settings.credentials_path)}))
+    _table(
+        "Authorization",
+        ("Status", "Credentials Path"),
+        (("authorized", str(settings.credentials_path)),),
+    )
 
 
-@app.command()
-def scan(
+def _process(
     ctx: typer.Context,
-    fixture: Annotated[Path | None, typer.Option("--fixture", help="Local Gmail JSON fixture; no network.")] = None,
-    max_results: Annotated[int, typer.Option(min=1, max=500)] = 50,
+    *,
+    fixture: Path | None,
+    apply: bool,
+    forwarding_address: str | None,
+    gmail_query: str | None,
+    categories: frozenset[Category],
+    title: str,
 ) -> None:
-    """Read only the fixed Gmail query is:unread in:inbox and normalize it."""
-    messages, _ = _messages(_settings(ctx), fixture, max_results)
-    typer.echo(json.dumps({"query": "is:unread in:inbox", "count": len(messages), "messages": [m.as_dict() for m in messages]}, ensure_ascii=False))
-
-
-@app.command()
-def classify(
-    ctx: typer.Context,
-    fixture: Annotated[Path | None, typer.Option("--fixture", help="Local Gmail JSON fixture; no network.")] = None,
-    max_results: Annotated[int, typer.Option(min=1, max=500)] = 50,
-) -> None:
-    """Classify normalized unread inbox messages with reasons and confidence."""
-    settings = _settings(ctx)
-    messages, _ = _messages(settings, fixture, max_results)
-    records = [
-        {"message_id": message.message_id, "subject": message.subject, "sender": message.sender_email, **result.as_dict()}
-        for message, result in _classifications(messages, settings)
-    ]
-    typer.echo(json.dumps({"count": len(records), "classifications": records}, ensure_ascii=False))
-
-
-@app.command()
-def process(
-    ctx: typer.Context,
-    fixture: Annotated[Path | None, typer.Option("--fixture", help="Local Gmail JSON fixture; preview only.")] = None,
-    apply: Annotated[bool, typer.Option("--apply", help="Perform allowed mutations.")] = False,
-    allow_delete: Annotated[bool, typer.Option("--allow-delete", help="Allow high-confidence advertisement deletion.")] = False,
-    max_results: Annotated[int, typer.Option(min=1, max=500)] = 50,
-) -> None:
-    """Plan actions by default; --apply is required for every mutation."""
     if apply and fixture:
         raise typer.BadParameter("--apply cannot use a fixture because it has no Gmail API client")
+    if apply and Category.INVOICE in categories and not forwarding_address:
+        raise typer.BadParameter("--forwarding-address is required when applying invoice forwarding")
     settings = _settings(ctx)
-    messages, client = _messages(settings, fixture, max_results, include_attachment_data=apply)
-    planned = [
-        (message, result, candidate)
-        for message, result in _classifications(messages, settings)
-        if (candidate := plan(message, result, allow_delete)) is not None
-    ]
-    output: list[dict[str, Any]] = []
+    client: GmailClient | None = None
+    if apply:
+        logger.info("Starting {title} apply; loading unread inbox messages.", title=title.lower())
+    if fixture:
+        messages = [normalize_message(raw) for raw in _load_fixture(fixture)]
+    else:
+        client = GoogleGmailClient.from_credentials(settings.credentials_path, settings.client_secret_path)
+        stubs = client.list_unread_inbox(gmail_query) if gmail_query else client.list_unread_inbox()
+        raw_messages = client.get_messages([str(stub["id"]) for stub in stubs])
+        messages = [
+            normalize_message(
+                raw_message,
+                client.get_attachment,
+                include_attachment_data=False,
+            )
+            for raw_message in raw_messages
+        ]
+        logger.info(
+            "Loaded {message_count} unread inbox message(s); planning {title} apply.",
+            message_count=len(messages),
+            title=title.lower(),
+        )
+    rows: list[tuple[str, ...]] = []
     ledger = Ledger(settings.audit_db_path) if apply else None
     try:
+        planned = [
+            (message, result, candidate)
+            for message, result in _classifications(messages)
+            if result.category in categories and (candidate := plan(message, result)) is not None
+        ]
         for message, result, candidate in planned:
             status = "preview"
             if apply:
                 assert client is not None and ledger is not None
-                status = apply_plan(candidate, message, client, ledger, settings.forwarding_address, allow_delete)
-                logging.getLogger("miti").info(
-                    "process_action",
-                    extra={"fields": {"action": candidate.action, "message_id": message.message_id, "status": status}},
+                status = apply_plan(candidate, message, client, ledger, forwarding_address)
+                logger.info(
+                    "Processed {category} message {message_id}: {action} ({status})",
+                    category=candidate.category.value,
+                    message_id=message.message_id,
+                    action=candidate.action,
+                    status=status,
                 )
-            output.append({**candidate.as_dict(), "confidence": result.confidence, "reasons": list(result.reasons), "status": status})
+            rows.append(
+                (
+                    f"{candidate.message_id}\nThread: {candidate.thread_id}",
+                    candidate.action,
+                    candidate.category.value,
+                    status,
+                    f"{result.confidence:.0%}",
+                    f"{candidate.details}\n" + "\n".join(result.reasons),
+                )
+            )
     finally:
         if ledger:
             ledger.close()
-    typer.echo(json.dumps({"mode": "apply" if apply else "preview", "actions": output}, ensure_ascii=False))
-
-
-@rules_app.command("validate")
-def validate_rules(ctx: typer.Context) -> None:
-    """Validate configuration and expose the fixed rule precedence."""
-    settings = _settings(ctx)
-    warnings: list[str] = []
-    if not settings.forwarding_address:
-        warnings.append("forwarding_address is unset; invoice apply will be blocked")
-    typer.echo(json.dumps({
-        "valid": True,
-        "warnings": warnings,
-        "precedence": ["shift_report", "box_office_report", "invoice", "advertisement", "unclassified"],
-        "trusted_senders": len(settings.trusted_senders),
-        "trusted_domains": len(settings.trusted_domains),
-    }))
-
-
-@labels_app.command("ensure")
-def ensure_labels(ctx: typer.Context) -> None:
-    """Create missing required labels without changing message state."""
-    settings = _settings(ctx)
-    client = GoogleGmailClient.from_credentials(settings.credentials_path, settings.client_secret_path)
-    result = {name: client.ensure_label(name) for name in LABELS.values()}
-    typer.echo(json.dumps({"labels": result}, ensure_ascii=False))
+    _table(
+        f"{title} ({'Apply' if apply else 'Preview'}) ({len(rows)})",
+        ("Message", "Action", "Category", "Status", "Confidence", "Details"),
+        rows,
+    )
 
 
 @app.command()
-def review(ctx: typer.Context, limit: Annotated[int, typer.Option(min=1, max=500)] = 50) -> None:
-    """Show the most recent mutable actions from the SQLite audit ledger."""
-    path = _settings(ctx).audit_db_path
-    if not path.exists():
-        typer.echo(json.dumps({"actions": []}))
-        return
-    with sqlite3.connect(path) as connection:
-        rows = connection.execute(
-            """SELECT message_id, thread_id, action, status, details, created_at
-               FROM actions ORDER BY id DESC LIMIT ?""", (limit,)
-        ).fetchall()
-    keys = ("message_id", "thread_id", "action", "status", "details", "created_at")
-    typer.echo(json.dumps({"actions": [dict(zip(keys, row, strict=True)) for row in rows]}, ensure_ascii=False))
+def invoices(
+    ctx: typer.Context,
+    fixture: Annotated[Path | None, typer.Option("--fixture", help="Local Gmail JSON fixture; preview only.")] = None,
+    apply: Annotated[bool, typer.Option("--apply", help="Forward attached-PDF invoices.")] = False,
+    forwarding_address: Annotated[
+        str | None,
+        typer.Option("--forwarding-address", help="Address to receive forwarded invoices."),
+    ] = None,
+) -> None:
+    """Preview or forward invoice emails that already have a PDF attachment."""
+    _process(
+        ctx,
+        fixture=fixture,
+        apply=apply,
+        forwarding_address=forwarding_address,
+        gmail_query=INVOICE_QUERY,
+        categories=frozenset({Category.INVOICE}),
+        title="Invoices",
+    )
+
+
+@reports_app.command("shift-reports")
+def shift_reports(
+    ctx: typer.Context,
+    fixture: Annotated[Path | None, typer.Option("--fixture", help="Local Gmail JSON fixture; preview only.")] = None,
+    apply: Annotated[bool, typer.Option("--apply", help="Mark matching shift reports read and label them.")] = False,
+) -> None:
+    """Preview or process messages whose subject starts with Shift Report."""
+    _process(
+        ctx,
+        fixture=fixture,
+        apply=apply,
+        forwarding_address=None,
+        gmail_query=SHIFT_REPORT_QUERY,
+        categories=frozenset({Category.SHIFT_REPORT}),
+        title="Shift Reports",
+    )
+
+
+@reports_app.command("box-office")
+def box_office_reports(
+    ctx: typer.Context,
+    fixture: Annotated[Path | None, typer.Option("--fixture", help="Local Gmail JSON fixture; preview only.")] = None,
+    apply: Annotated[bool, typer.Option("--apply", help="Mark matching box-office reports read and label them.")] = False,
+) -> None:
+    """Preview or process messages with the exact Box Office subject."""
+    _process(
+        ctx,
+        fixture=fixture,
+        apply=apply,
+        forwarding_address=None,
+        gmail_query=BOX_OFFICE_REPORT_QUERY,
+        categories=frozenset({Category.BOX_OFFICE_REPORT}),
+        title="Box Office Reports",
+    )
+
+
+@app.command()
+def advertisements(
+    ctx: typer.Context,
+    fixture: Annotated[Path | None, typer.Option("--fixture", help="Local Gmail JSON fixture; preview only.")] = None,
+    apply: Annotated[bool, typer.Option("--apply", help="Mark matching advertisements read and label them.")] = False,
+) -> None:
+    """Preview or label matching advertisements and mark them read."""
+    _process(
+        ctx,
+        fixture=fixture,
+        apply=apply,
+        forwarding_address=None,
+        gmail_query=ADVERTISEMENT_QUERY,
+        categories=frozenset({Category.ADVERTISEMENT}),
+        title="Advertisements",
+    )
 
 
 def main() -> None:

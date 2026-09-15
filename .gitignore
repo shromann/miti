@@ -10,3 +10,4 @@ wheels/
 .venv
 
 graphify-out
+client_secret.json

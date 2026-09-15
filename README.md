@@ -10,50 +10,49 @@ uv sync --group dev
 # or: python -m pip install -e .
 ```
 
-Create `~/.config/miti/config.toml` (or provide `--config PATH`) without
-putting credentials in it:
-
-```toml
-forwarding_address = "your-xero-bills-address@example.com"
-# Optional exact addresses/domains; display names are never trusted.
-trusted_senders = ["billing@trusted-vendor.example"]
-trusted_domains = ["trusted-vendor.example"]
-known_vendors = ["invoices@vendor.example"]
-known_contacts = ["person@example.com"]
-```
-
-Create a Google OAuth **Desktop app** client and save its downloaded JSON as
-`~/.config/miti/client_secret.json`, then authorize:
+Create a Google OAuth **Desktop app** client, download its JSON, then authorize:
 
 ```bash
-miti auth
-# or: miti --config ./miti.toml auth --client-secret ./oauth-client.json
+miti auth ./oauth-client.json
 ```
 
 OAuth requests only `gmail.modify` and `gmail.send`. The resulting credential
-file is stored locally and tokens are never printed. Do not commit either OAuth
-JSON file.
+file and audit ledger are stored in `~/.config/miti/`, and tokens are never printed. `miti auth` always opens a
+fresh consent flow and replaces the stored credential, so run it again after
+changing required scopes. Do not commit either OAuth JSON file.
 
 ## Commands
 
-All Gmail reads begin with the fixed query `is:unread in:inbox`.
+All Gmail reads are limited to unread inbox messages. The report commands additionally
+filter their Gmail search by the relevant report subject before loading full messages.
+Advertisement processing is limited to messages Gmail categorizes as Promotions or that
+contain `unsubscribe`, before applying its local advertisement classification rules.
+Processing commands handle all matching unread inbox messages.
+
+`miti invoices` asks Gmail for unread inbox messages containing `invoice` with
+an attached PDF before it fetches message details. `miti` retrieves only the
+headers, MIME structure, and text/HTML content needed to classify each matching
+message. It reads PDF bytes only for a classified invoice being forwarded with
+`--apply`, because Gmail's API requires those bytes to create the forwarded
+message with its attachment.
 
 ```bash
-miti scan                         # normalized unread inbox JSON
-miti classify                     # categories, confidence, and rule reasons
-miti process                      # preview only: no Gmail mutations
-miti process --apply              # process reports and safe invoices
-miti process --apply --allow-delete # additionally delete high-confidence ads
-miti rules validate
-miti labels ensure
-miti review                       # recent SQLite audit actions
+miti auth                         # authorize Gmail access
+miti invoices                     # preview invoice forwarding actions
+miti invoices --apply --forwarding-address your-xero-bills-address@example.com
+miti reports shift-reports        # preview shift-report actions
+miti reports shift-reports --apply
+miti reports box-office           # preview box-office-report actions
+miti reports box-office --apply
+miti advertisements               # preview advertisement actions
+miti advertisements --apply       # label advertisements and mark them read
 ```
 
 For offline demonstrations and tests, pass a Gmail API message JSON object or
-array with `--fixture` to `scan`, `classify`, or preview `process`:
+array with `--fixture` to any preview processing command:
 
 ```bash
-miti classify --fixture examples/message.json
+miti invoices --fixture examples/message.json
 ```
 
 ## Safety and deterministic rules
@@ -61,13 +60,12 @@ miti classify --fixture examples/message.json
 Classification has fixed precedence: a subject starting `Shift Report`, then
 the exact Box Office subject `BOR - Golden Age Cinema- Nightly`, then
 conservative invoices, then advertisements. Invoice forwarding requires both
-invoice evidence and either an existing PDF or an HTTPS link.
-Downloaded links must remain HTTPS through redirects, return
-`application/pdf`, fit the size limit, and start with `%PDF-`.
+invoice evidence and an existing PDF attachment. Invoice emails that only link
+to a PDF are left untouched.
 
-Reports are marked read and receive `Reports/GAC Daily Reports` or `Box Office
-Report`. A forwarded invoice is only marked read, labeled `Accounts Payable`,
+Reports are marked read, receive `Reports/GAC Daily Reports` or `Box Office
+Report`, and are removed from the inbox. A forwarded invoice is only marked read, labeled `Accounts Payable`,
 and removed from the inbox **after sending succeeds**. Other labels remain.
 The SQLite ledger records every applied action and prevents forwarding the same
-invoice twice. Advertisement deletion additionally requires `--apply` and
-`--allow-delete`; all other advertisement results stay reviewable in preview.
+invoice twice. Advertisements are labeled `Advertisements` and marked read
+when `miti advertisements --apply` is used, then removed from the inbox.
