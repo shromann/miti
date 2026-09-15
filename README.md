@@ -9,11 +9,11 @@
 
 2. if the email has a pdf:
     forward invoice to Xero Bills
-    
+
 4. mark   original as read
 3. label  original as `Accounts Payable`
 5. remove original from inbox
-
+ 
 ### Reports
 #### Shift Reports
 - mark as read
