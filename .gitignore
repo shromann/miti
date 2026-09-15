@@ -10,3 +10,4 @@ wheels/
 .venv
 
 graphify-out
+*.json

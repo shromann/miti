@@ -1,16 +1,31 @@
 [project]
 name = "miti"
 version = "0.1.0"
-description = "Add your description here"
+description = "Rule-first, auditable Gmail inbox automation"
 readme = "README.md"
 authors = [
     { name = "Shromann Majumder", email = "shromannmajumder@gmail.com" }
 ]
 requires-python = ">=3.12"
-dependencies = []
+dependencies = [
+    "google-api-python-client>=2.160",
+    "google-auth-oauthlib>=1.2",
+    "loguru>=0.7",
+    "rich>=15.0.0",
+    "typer>=0.15",
+]
 
 [project.scripts]
-miti = "miti:main"
+miti = "miti.cli:main"
+
+[dependency-groups]
+dev = [
+    "pytest>=8.3",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
 
 [build-system]
 requires = ["hatchling"]
